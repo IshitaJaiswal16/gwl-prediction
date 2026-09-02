@@ -15,7 +15,7 @@ from src import feature_engineering as fe
 
 def fetch_raw(well_id: str, lat: float, lon: float):
     print(f"[1/4] Fetching GWL data for well {well_id} ...")
-    gwl_df = data_fetch.get_gwl_daily_timeseries(well_id, config.START_DATE, config.END_DATE)
+    gwl_df = data_fetch.get_gwl_timeseries(well_id, config.START_DATE, config.END_DATE)
     gwl_df.to_csv(config.DATA_RAW_DIR / f"{well_id}_gwl_raw.csv", index=False)
     print(f"      {len(gwl_df)} readings saved.")
 
@@ -31,6 +31,7 @@ def build_dataset(well_id: str, gwl_df: pd.DataFrame, climate_df: pd.DataFrame) 
     print("[3/4] Resampling to monthly + handling missing values ...")
     monthly = preprocessing.resample_monthly(gwl_df, climate_df)
     monthly = preprocessing.handle_missing(monthly)
+    monthly.to_csv(config.DATA_PROCESSED_DIR / f"{well_id}_monthly.csv", index=False)
 
     print("[4/4] Building lag/temporal features ...")
     feature_table = fe.build_feature_table(monthly)

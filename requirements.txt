@@ -7,3 +7,4 @@ xgboost>=2.0
 matplotlib>=3.7
 tensorflow>=2.15
 shap>=0.44
+python-dotenv>=1.0
