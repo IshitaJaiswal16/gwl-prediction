@@ -84,6 +84,10 @@ def run_walk_forward_cv(features_df, well_id: str, n_splits: int = 4):
 
         print(f"  Fold {fold_i}: train={len(train_df)}, test={len(test_df)}")
 
+    for model_name, scores_list in fold_scores.items():
+        pd.DataFrame(scores_list, index=[f"fold_{i+1}" for i in range(len(scores_list))]) \
+            .to_csv(RESULTS_DIR / f"{well_id}_{model_name.replace(' ', '_').lower()}_per_fold.csv")
+
     summary = {}
     for model_name, scores_list in fold_scores.items():
         metric_names = scores_list[0].keys()
