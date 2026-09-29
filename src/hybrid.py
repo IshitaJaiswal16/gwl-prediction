@@ -85,10 +85,12 @@ def build_hybrid_dataset(features_df: pd.DataFrame, emb_df: pd.DataFrame):
 
 def train_hybrid(monthly_df: pd.DataFrame, features_df: pd.DataFrame,
                   lookback: int = 6, test_fraction: float = config.TEST_FRACTION,
-                  epochs: int = 100):
+                  epochs: int = 100, xgb_params: dict = None):
     """End-to-end: train LSTM encoder on the train split -> extract
     embeddings for every date -> merge with tabular features -> re-split
-    chronologically -> train XGBoost on train, predict test."""
+    chronologically -> train XGBoost on train, predict test.
+    xgb_params defaults to the original untuned config if not given, so
+    existing callers (run_hybrid.py) are unaffected."""
     set_all_seeds()
     lstm_model, scaler = train_lstm_encoder(monthly_df, lookback, test_fraction, epochs)
     n_features = len(seqf.SEQUENCE_FEATURE_COLUMNS)
@@ -103,10 +105,9 @@ def train_hybrid(monthly_df: pd.DataFrame, features_df: pd.DataFrame,
     X_test = test_df[hybrid_feature_columns]
     y_test = test_df[fe.TARGET_COLUMN].to_numpy()
 
-    xgb_model = XGBRegressor(
-        n_estimators=300, learning_rate=0.05, max_depth=4,
-        random_state=config.RANDOM_SEED, n_jobs=-1,
-    )
+    if xgb_params is None:
+        xgb_params = dict(n_estimators=300, learning_rate=0.05, max_depth=4)
+    xgb_model = XGBRegressor(**xgb_params, random_state=config.RANDOM_SEED, n_jobs=-1)
     xgb_model.fit(X_train, y_train)
     y_pred = xgb_model.predict(X_test)
 
@@ -158,14 +159,13 @@ def prepare_fold_lstm_data(monthly_train: pd.DataFrame, monthly_test_window: pd.
     return {"X_train": X_train, "y_train": y_train, "X_test": X_test, "scaler": scaler}
 
 
-def train_hybrid_fold(monthly_df: pd.DataFrame, train_df: pd.DataFrame, test_df: pd.DataFrame,
-                       lookback: int = 6, epochs: int = 100):
-    """One fold of strict hybrid walk-forward CV. A brand-new LSTM encoder
-    and a brand-new XGBoost model are trained from scratch here, using
-    ONLY this fold's training period. monthly_train never includes any
-    date at or after the fold's test start; the fold's test rows only
-    ever see frozen inference (embedding extraction, XGBoost.predict),
-    never training."""
+def compute_fold_embeddings(monthly_df: pd.DataFrame, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                             lookback: int = 6, epochs: int = 100):
+    """Stage 1 of a fold: train the LSTM encoder once, extract embeddings,
+    merge with tabular features. Split out from train_hybrid_fold so
+    hyperparameter search can reuse these embeddings across many XGBoost
+    candidates without retraining the LSTM each time."""
+    set_all_seeds()
     fold_train_end = train_df["date"].max()
     fold_test_start = test_df["date"].min()
     fold_test_end = test_df["date"].max()
@@ -181,9 +181,6 @@ def train_hybrid_fold(monthly_df: pd.DataFrame, train_df: pd.DataFrame, test_df:
     n_features = len(seqf.SEQUENCE_FEATURE_COLUMNS)
     lstm_model = baselines.build_lstm_model(lookback, n_features)
     early_stop = keras.callbacks.EarlyStopping(monitor="loss", patience=10, restore_best_weights=True)
-    # NOTE: monitors training loss only - no validation split is used, so
-    # no future/test data influences when training stops. Matches the
-    # existing baseline LSTM's behaviour.
     lstm_model.fit(lstm_data["X_train"], lstm_data["y_train"], epochs=epochs,
                     batch_size=8, verbose=0, callbacks=[early_stop])
 
@@ -192,9 +189,6 @@ def train_hybrid_fold(monthly_df: pd.DataFrame, train_df: pd.DataFrame, test_df:
     test_embeddings = encoder.predict(lstm_data["X_test"], verbose=0)
 
     emb_cols = [f"lstm_emb_{j}" for j in range(train_embeddings.shape[1])]
-    # Sequence row i uses raw rows [i, i+lookback) as input and predicts
-    # raw row (i+lookback) - so embedding row i belongs to date
-    # monthly_train.date[i + lookback].
     train_emb_dates = monthly_train["date"].iloc[lookback:].reset_index(drop=True)
     test_emb_dates = test_df["date"].reset_index(drop=True)
 
@@ -208,18 +202,35 @@ def train_hybrid_fold(monthly_df: pd.DataFrame, train_df: pd.DataFrame, test_df:
     assert len(fold_test_merged) == len(test_df), "test embedding alignment dropped rows unexpectedly"
 
     hybrid_feature_columns = fe.FEATURE_COLUMNS + emb_cols
-    X_train = fold_train_merged[hybrid_feature_columns]
-    y_train = fold_train_merged[fe.TARGET_COLUMN]
-    X_test = fold_test_merged[hybrid_feature_columns]
-    y_test = fold_test_merged[fe.TARGET_COLUMN].to_numpy()
+    return {
+        "X_train": fold_train_merged[hybrid_feature_columns],
+        "y_train": fold_train_merged[fe.TARGET_COLUMN],
+        "X_test": fold_test_merged[hybrid_feature_columns],
+        "y_test": fold_test_merged[fe.TARGET_COLUMN].to_numpy(),
+        "feature_columns": hybrid_feature_columns,
+    }
 
-    xgb_model = XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=4,
-                              random_state=config.RANDOM_SEED, n_jobs=-1)
-    xgb_model.fit(X_train, y_train)
-    y_pred = xgb_model.predict(X_test)
 
-    return y_test, y_pred, len(fold_train_merged), len(fold_test_merged)
+def train_xgb_on_fold_embeddings(fold_data: dict, xgb_params: dict):
+    """Stage 2 of a fold: train XGBoost on pre-computed embeddings. Cheap
+    to call repeatedly with different xgb_params for hyperparameter search."""
+    model = XGBRegressor(**xgb_params, random_state=config.RANDOM_SEED, n_jobs=-1)
+    model.fit(fold_data["X_train"], fold_data["y_train"])
+    y_pred = model.predict(fold_data["X_test"])
+    scores = metrics.evaluate(fold_data["y_test"], y_pred)
+    return model, y_pred, scores
 
+
+def train_hybrid_fold(monthly_df: pd.DataFrame, train_df: pd.DataFrame, test_df: pd.DataFrame,
+                       lookback: int = 6, epochs: int = 100):
+    """One fold of strict hybrid walk-forward CV, using the default XGBoost
+    config. Thin wrapper over compute_fold_embeddings +
+    train_xgb_on_fold_embeddings, kept so existing callers
+    (run_strict_hybrid_walk_forward_cv) don't need to change."""
+    fold_data = compute_fold_embeddings(monthly_df, train_df, test_df, lookback, epochs)
+    default_xgb_params = dict(n_estimators=300, learning_rate=0.05, max_depth=4)
+    _, y_pred, scores = train_xgb_on_fold_embeddings(fold_data, default_xgb_params)
+    return fold_data["y_test"], y_pred, len(fold_data["X_train"]), len(fold_data["X_test"])
 
 def run_strict_hybrid_walk_forward_cv(monthly_df: pd.DataFrame, features_df: pd.DataFrame,
                                        n_splits: int = 4, lookback: int = 6, epochs: int = 100):
